@@ -8,6 +8,7 @@ import time
 import urllib.request
 from distutils.spawn import find_executable
 from tarfile import TarFile
+from zipfile import ZipFile
 from tempfile import TemporaryDirectory
 
 try:
@@ -81,10 +82,14 @@ class Package(object):
 
     def version(self):
         global BAD_MAGIC
+        real_hash = False
 
         _, base, _ = os.path.basename(self.filename).split('-')
 
-        if '.dev' in base:
+        if '+g' in base:
+            tag, post_commit = base.split('+g')
+            real_hash = True
+        elif '.dev' in base:
             tag, post_commit = base.split('.dev')
         elif 'dev' in base:
             # astropy is the ONLY package with this problem
@@ -98,6 +103,9 @@ class Package(object):
             post_commit = (int(post_commit) << 32) | BAD_MAGIC
         else:
             return base, 0
+
+        if real_hash:
+            return tag, post_commit
 
         return tag, int(post_commit)
 
@@ -197,14 +205,40 @@ def download(url, dest):
 
     print('Downloading {0}'.format(url))
     # try/except something here... docs are unclear
-    path, _ = urllib.request.urlretrieve(url, dest)
-    return path
+    #path, _ = urllib.request.urlretrieve(url, dest)
+    with urllib.request.urlopen(url) as remote:
+        print("opened {}".format(url))
+        with open(dest, 'w+b') as fp:
+            print("writing {}".format(dest))
+            fp.write(remote.read())
+
+    return dest
+
+def mkdest(orig, dest):
+    dname = dest
+    fname = os.path.basename(orig)
+    new_dir = os.path.join(dname, os.path.splitext(fname)[0])
+    print(dname)
+    print(fname)
+    print(new_dir)
+
+    # Sometimes the new_dir name matches the archive's internal parent
+    # so in that case, we don't care if the directory exists
+    os.makedirs(new_dir, exist_ok=True)
+
+    return new_dir
 
 
 def untar(path, dest='.'):
-    print('Extracting {0}'.format(path))
+    print('Extracting {0} to {1}'.format(path, dest))
     with TarFile.open(path, 'r:*') as tarball:
         tarball.extractall(dest)
+
+
+def unzip(path, dest='.'):
+    print('Extracting {0} to {1}'.format(path, dest))
+    with ZipFile(path, 'r') as zipf:
+        zipf.extractall(dest)
 
 
 def git(task, *args):
@@ -213,7 +247,7 @@ def git(task, *args):
         assert isinstance(arg, str)
 
     cmd = ['git', task]
-    tasks = ['clone', 'checkout', 'log', 'fetch']
+    tasks = ['clone', 'checkout', 'describe', 'log', 'fetch', 'rev-list', 'tag']
 
     for arg in args:
         cmd.append(arg)
@@ -237,7 +271,7 @@ def git(task, *args):
 
 
 def git_clone(url, path=''):
-    git('clone', url, path)
+    git('clone', '--recursive', url, path)
 
 
 def git_checkout(path, rev):
@@ -263,7 +297,9 @@ def git_commit_from_offset(path, tag, post_commit):
 
     os.chdir(path)
     name = os.path.basename(path).split('-')[0]
-    tags = [tag, 'v' + tag, '-'.join([name, tag]), name + '-' + 'v' + tag]
+    _revlist_tag = git('rev-list', '--tags', '--max-count=1').strip()
+    _latest_tag = git('describe', '--tags', _revlist_tag).strip()
+    tags = [tag, 'v' + tag, '-'.join([name, tag]), name + '-' + 'v' + tag, _latest_tag]
     offset = tag + '..' + 'master'
     result = ''
 
@@ -295,6 +331,7 @@ def git_commit_from_offset(path, tag, post_commit):
 
     tail = len(result)
     rev, message = result[tail - post_commit].rstrip().split(' ', 1)
+    print("{} - {} = {}".format(tail, post_commit, tail - post_commit))
 
     os.chdir(cwd)
     return rev
@@ -302,6 +339,9 @@ def git_commit_from_offset(path, tag, post_commit):
 
 def filter_commit(x):
     has_magic = False
+    if isinstance(x, str):
+        return x, has_magic
+
     if (x & 0xffffffff) == BAD_MAGIC:
         print('BAD_MAGIC ({0:#08x}) detected!'.format(BAD_MAGIC))
         x >>= 32
@@ -435,14 +475,27 @@ if __name__ == '__main__':
                                         tag, str(post_commit)]))
 
                 git_clone(url, dest)
-                offset = git_commit_from_offset(dest, tag, post_commit)
+
+                if isinstance(post_commit, int):
+                    offset = git_commit_from_offset(dest, tag, post_commit)
+                else:
+                    offset = post_commit
                 git_checkout(dest, offset)
 
             elif pkg.source_type == 'archive':
+                # Source URLs can be arbitrary files. It's awesome. Thanks continuum!
+                base = os.path.basename(url)
+                # tempdir2 is truly temporary. It's only used to download the archive.
                 with TemporaryDirectory() as tempdir2:
-                    dest = os.path.join(tempdir2, os.path.basename(url))
+                    dest = os.path.join(tempdir2, base)
                     archive = download(url, dest)
-                    untar(archive, tempdir)
+                    if '.tar' in base:
+                        untar(archive, tempdir)
+                    elif '.zip' in base:
+                        unzip(archive, tempdir)
+                    else:
+                        continue
+
 
             total_processed += 1
             print()
@@ -450,6 +503,8 @@ if __name__ == '__main__':
         print('\nProccessed: {0}\nSkipped: {1}\n'.format(total_processed, total_skipped))
 
         if total_processed:
+            #from glob import glob
+            #result = sloccount(' '.join(glob(os.path.join(tempdir, '*'))))
             result = sloccount(tempdir)
             print(result)
         else:
